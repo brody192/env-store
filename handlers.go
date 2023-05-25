@@ -116,6 +116,11 @@ func (e *envHandler) SetEnv(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if len(reqBodyMap) > maxVariables {
+		jsonError(w, fmt.Sprintf("max variables of %d exceeded", maxVariables), http.StatusBadRequest)
+		return
+	}
+
 	for k, v := range reqBodyMap {
 		if utf8.RuneCountInString(k) > maxKeyLength {
 			jsonError(w, fmt.Sprintf("key length exceeds %d characters", maxKeyLength), http.StatusBadRequest)
@@ -141,13 +146,13 @@ func (e *envHandler) SetEnv(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(redisMap)+len(reqBodyMap) > maxVariables {
-		jsonError(w, fmt.Sprintf("max variables of %d exceeded", maxVariables), http.StatusBadRequest)
-		return
-	}
-
 	for k, v := range reqBodyMap {
 		redisMap[k] = v
+	}
+
+	if len(redisMap) > maxVariables {
+		jsonError(w, fmt.Sprintf("max variables of %d exceeded", maxVariables), http.StatusBadRequest)
+		return
 	}
 
 	if err := e.SetEnvRedis(creds, redisMap); err != nil {
