@@ -6,16 +6,25 @@ import (
 	"encoding/gob"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"unicode/utf8"
+
+	"main/crypt"
 
 	"github.com/brody192/basiclogger"
 	"github.com/brody192/ext/extrespond"
 	"github.com/brody192/ext/extutil"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+)
+
+const (
+	maxKeyLength   = 128
+	maxValueLength = 1024
+	maxVariables   = 128
 )
 
 type envHandler struct {
@@ -118,19 +127,39 @@ func (e *envHandler) SetEnv(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for k, v := range reqBodyMap {
-		if utf8.RuneCountInString(k) > 128 {
-			e.Error(w, "key length exceeds 128 characters", http.StatusBadRequest)
+		if utf8.RuneCountInString(k) > maxKeyLength {
+			e.Error(w, fmt.Sprintf("key length exceeds %d characters", maxKeyLength), http.StatusBadRequest)
 			return
 		}
 
-		if utf8.RuneCountInString(v) > 1024 {
-			e.Error(w, "value length exceeds 1024 characters", http.StatusBadRequest)
+		if utf8.RuneCountInString(v) > maxValueLength {
+			e.Error(w, fmt.Sprintf("value length exceeds %d characters", maxValueLength), http.StatusBadRequest)
 			return
 		}
 	}
 
-	if err := e.SetEnvRedis(e.GetCredentials(r), reqBodyMap); err != nil {
-		if unAuth := e.HandleUnAuth(w, err); unAuth {
+	var redisMap, err = e.GetEnvRedis(e.GetCredentials(r))
+	if err != nil {
+		if unAuth := e.HandleCryptError(w, err); unAuth {
+			return
+		}
+
+		basiclogger.Error.Println("failed to get redis data => ", err)
+		e.Error(w, "failed to get redis data", http.StatusInternalServerError)
+		return
+	}
+
+	if len(redisMap)+len(reqBodyMap) > maxVariables {
+		e.Error(w, fmt.Sprintf("max variables of %d exceeded", maxVariables), http.StatusBadRequest)
+		return
+	}
+
+	for k, v := range reqBodyMap {
+		redisMap[k] = v
+	}
+
+	if err := e.SetEnvRedis(e.GetCredentials(r), redisMap); err != nil {
+		if unAuth := e.HandleCryptError(w, err); unAuth {
 			return
 		}
 
@@ -153,7 +182,7 @@ func (e *envHandler) GetEnv(w http.ResponseWriter, r *http.Request) {
 
 	var resMap, err = e.GetEnvRedis(e.GetCredentials(r))
 	if err != nil {
-		if unAuth := e.HandleUnAuth(w, err); unAuth {
+		if unAuth := e.HandleCryptError(w, err); unAuth {
 			return
 		}
 
@@ -188,7 +217,7 @@ func (e *envHandler) DelEnv(w http.ResponseWriter, r *http.Request) {
 
 	var resMap, err = e.GetEnvRedis(e.GetCredentials(r))
 	if err != nil {
-		if unAuth := e.HandleUnAuth(w, err); unAuth {
+		if unAuth := e.HandleCryptError(w, err); unAuth {
 			return
 		}
 
@@ -205,19 +234,19 @@ func (e *envHandler) DelEnv(w http.ResponseWriter, r *http.Request) {
 		delete(resMap, k)
 	}
 
-	if err := e.OverwriteEnvRedis(e.GetCredentials(r), resMap); err != nil {
+	if err := e.SetEnvRedis(e.GetCredentials(r), resMap); err != nil {
 		basiclogger.Error.Println("failed to set redis data =>", err)
 		extrespond.PlainText(w, "failed to set redis data", http.StatusInternalServerError)
 		return
 	}
 
-	extrespond.PlainText(w, http.StatusText(http.StatusOK), http.StatusOK)
+	extrespond.JSONString(w, "{}", http.StatusOK)
 }
 
 func (e *envHandler) GetAllEnv(w http.ResponseWriter, r *http.Request) {
 	var resMap, err = e.GetEnvRedis(e.GetCredentials(r))
 	if err != nil {
-		if unAuth := e.HandleUnAuth(w, err); unAuth {
+		if unAuth := e.HandleCryptError(w, err); unAuth {
 			return
 		}
 
@@ -229,7 +258,7 @@ func (e *envHandler) GetAllEnv(w http.ResponseWriter, r *http.Request) {
 	extrespond.JSON(w, resMap, http.StatusOK)
 }
 
-var ErrPasswordIncorrect = errors.New("password is incorrect")
+var ErrCrypt = errors.New("crypt error")
 
 func (e *envHandler) GetEnvRedis(creds *credentials) (kvMap, error) {
 	var resMap = kvMap{}
@@ -243,9 +272,9 @@ func (e *envHandler) GetEnvRedis(creds *credentials) (kvMap, error) {
 		return resMap, nil
 	}
 
-	decodedBytes, err := Decrypt([]byte(creds.password), resRedis)
+	decodedBytes, err := crypt.Decrypt([]byte(creds.password), resRedis)
 	if err != nil {
-		return resMap, ErrPasswordIncorrect
+		return resMap, ErrCrypt
 	}
 
 	if err := gob.NewDecoder(bytes.NewReader(decodedBytes)).Decode(&resMap); err != nil {
@@ -255,46 +284,16 @@ func (e *envHandler) GetEnvRedis(creds *credentials) (kvMap, error) {
 	return resMap, nil
 }
 
-func (e *envHandler) OverwriteEnvRedis(creds *credentials, newMap kvMap) error {
+func (e *envHandler) SetEnvRedis(creds *credentials, newMap kvMap) error {
 	var buf = &bytes.Buffer{}
 
 	if err := gob.NewEncoder(buf).Encode(&newMap); err != nil {
 		return err
 	}
 
-	var encodedBytes, err = Encrypt([]byte(creds.password), buf.Bytes())
-	if err != nil {
-		return err
-	}
-
-	if err := e.redis.Set(e.ctx, creds.userId, encodedBytes, 0).Err(); err != nil {
-		return err
-	}
-
 	defer buf.Reset()
 
-	return nil
-}
-
-func (e *envHandler) SetEnvRedis(creds *credentials, newMap kvMap) error {
-	envMap, err := e.GetEnvRedis(creds)
-	if err != nil {
-		return err
-	}
-
-	for k, v := range newMap {
-		envMap[k] = v
-	}
-
-	var buf = &bytes.Buffer{}
-
-	if err := gob.NewEncoder(buf).Encode(&envMap); err != nil {
-		return err
-	}
-
-	defer buf.Reset()
-
-	encodedBytes, err := Encrypt([]byte(creds.password), buf.Bytes())
+	encodedBytes, err := crypt.Encrypt([]byte(creds.password), buf.Bytes())
 	if err != nil {
 		return err
 	}
@@ -306,8 +305,8 @@ func (e *envHandler) SetEnvRedis(creds *credentials, newMap kvMap) error {
 	return nil
 }
 
-func (e *envHandler) HandleUnAuth(w http.ResponseWriter, err error) bool {
-	if errors.Is(err, ErrPasswordIncorrect) {
+func (e *envHandler) HandleCryptError(w http.ResponseWriter, err error) bool {
+	if errors.Is(err, ErrCrypt) {
 		e.Error(w, err.Error(), http.StatusUnauthorized)
 		return true
 	}

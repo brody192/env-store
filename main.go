@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
+	"main/client"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/brody192/basiclogger"
@@ -11,15 +14,21 @@ import (
 	"github.com/brody192/ext/extutil"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/httprate"
 	"github.com/rs/cors"
 )
 
 func main() {
-	var env, err = NewClient()
+	var rClient, err = client.NewRedisClient(os.Getenv("REDIS_URL"))
 	if err == nil {
 		basiclogger.InfoBasic.Println("redis connected successfully")
 	} else if err != nil {
 		basiclogger.Error.Fatal(err)
+	}
+
+	var env = &envHandler{
+		ctx:   context.Background(),
+		redis: rClient,
 	}
 
 	var r = chi.NewRouter()
@@ -34,10 +43,14 @@ func main() {
 	r.Use(middleware.NoCache)
 	r.Use(cors.AllowAll().Handler)
 
+	var rateLimit1 = httprate.LimitByIP(1, 1*time.Second)
+	var rateLimit2 = httprate.LimitByIP(2, 1*time.Second)
+
 	r.Route("/env", func(r chi.Router) {
-		r.Get("/user", env.GenUser)
+		r.With(rateLimit1).Get("/user", env.GenUser)
 
 		r.Group(func(r chi.Router) {
+			r.Use(rateLimit2)
 			r.Use(env.Auth)
 
 			r.Post("/set", env.SetEnv)
@@ -46,6 +59,8 @@ func main() {
 			r.Delete("/delete", env.DelEnv)
 		})
 	})
+
+	exthandler.RegisterTrailing(r)
 
 	var port = extutil.EnvPortOr("3000")
 
