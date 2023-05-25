@@ -156,10 +156,6 @@ func (e *envHandler) SetEnv(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := e.SetEnvRedis(creds, redisMap); err != nil {
-		if unAuth := handleCryptError(w, err); unAuth {
-			return
-		}
-
 		basiclogger.Error.Println("failed to set redis data =>", err)
 		jsonError(w, "failed to set redis data", http.StatusInternalServerError)
 		return
@@ -292,7 +288,7 @@ func (e *envHandler) SetEnvRedis(creds *credentials, newMap kvMap) error {
 
 	encodedBytes, err := crypt.Encrypt([]byte(creds.password), buf.Bytes())
 	if err != nil {
-		return err
+		return ErrCrypt
 	}
 
 	if err := e.redis.Set(e.ctx, creds.userId, encodedBytes, 0).Err(); err != nil {
